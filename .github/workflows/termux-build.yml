@@ -231,28 +231,59 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
           df -h /
 
-      - name: "Cache cargo/rustup"
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: "Checkout vaultwarden ${SOURCE_VERSION}"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            ~/.rustup/toolchains
-          key: termux-${{ env.TARGET }}-rust-${{ env.SOURCE_SHA }}
-          restore-keys: |
-            termux-${{ env.TARGET }}-rust-
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_SHA }}
+          path: src
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
 
-      - name: "Install Rust, cargo-zigbuild and zig"
+      - name: "Show source revision"
+        working-directory: src
         run: |
           set -euo pipefail
+          git log -1 --format='%H %ci %s'
+
+      - name: "Install Rust toolchain"
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # Use the toolchain the checkout pins (same logic as upstream's build.yml).
+          RUST_TOOLCHAIN="$(grep -m1 -oP 'channel.*"(\K.*?)(?=")' rust-toolchain.toml || true)"
+          if [[ -z "${RUST_TOOLCHAIN}" ]]; then
+            echo "::error::Could not read the rust toolchain from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "Installing Rust ${RUST_TOOLCHAIN}"
+
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
-          sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal --default-toolchain 1.98.1
+          sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
+            --default-toolchain "${RUST_TOOLCHAIN}"
+
           export PATH="${HOME}/.cargo/bin:${PATH}"
-          rustc -vV
           rustup target add "${TARGET}"
-          cargo install cargo-zigbuild --locked
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+          rustc -vV
+
+      # rust-cache (the action upstream itself uses) caches ~/.cargo/registry,
+      # ~/.cargo/bin and target/. It is safer than a hand written actions/cache:
+      # restoring ~/.rustup/toolchains without ~/.rustup/settings.toml makes the
+      # next rustup invocation abort, and zig/cargo-zigbuild are not mixed in.
+      - name: "Cache cargo"
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: "src -> target"
+          key: "${{ env.TARGET }}"
+          cache-on-failure: true
+
+      - name: "Install cargo-zigbuild and zig"
+        run: |
+          set -euo pipefail
+          export PATH="${HOME}/.cargo/bin:${PATH}"
+          command -v cargo-zigbuild >/dev/null 2>&1 || cargo install cargo-zigbuild --locked
 
           # zig comes from the ziglang wheel: the binary lives inside the python
           # package, so it is exposed as an executable named "zig" on PATH.
@@ -269,22 +300,6 @@ jobs:
           ln -sf "${ZIG_BIN}" "${HOME}/.local/bin/zig"
           echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
           "${HOME}/.local/bin/zig" version
-
-      - name: "Checkout vaultwarden ${SOURCE_VERSION}"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.SOURCE_SHA }}
-          path: src
-          fetch-depth: 0
-          fetch-tags: true
-          persist-credentials: false
-
-      - name: "Show source revision"
-        working-directory: src
-        run: |
-          set -euo pipefail
-          git log -1 --format='%H %ci %s'
 
       - name: "Build (static aarch64-unknown-linux-musl)"
         working-directory: src
