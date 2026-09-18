@@ -1,6 +1,9 @@
 # Local build artifacts
 target
 
+# Local cross-compile sandbox used while developing the Termux build
+.localbuild
+
 # Data folder
 data
 

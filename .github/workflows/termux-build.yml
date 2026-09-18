@@ -1,0 +1,408 @@
+name: Build Termux aarch64 binary
+
+# ---------------------------------------------------------------------------
+# Builds a *static* aarch64 (arm64) Linux binary of vaultwarden that runs on
+# Termux (Android arm64) and on any other musl/aarch64 Linux system, and
+# publishes it as a GitHub release (tag: termux-<version>).
+#
+# How new versions happen:
+#   * every day at 03:00 UTC the workflow looks for a new upstream release and,
+#     if it has not been built yet, builds and releases it;
+#   * you can also start it by hand (Actions -> this workflow -> Run workflow),
+#     leaving the tag empty to build the newest upstream release;
+#   * a push to this fork (main / termux-build) builds the pushed commit and
+#     keeps the binary as a run artifact; a push of a "termux-*" tag publishes
+#     that build as a release.
+#
+# Why cargo-zigbuild instead of plain aarch64-linux-musl-gcc:
+#   * OpenSSL is compiled from source (vendored_openssl) and linked statically,
+#     so the result has no shared library dependencies;
+#   * zig ships the Android NDK stub libc (libc.so with the syscall stubs that
+#     Android needs). A plain musl-gcc build is refused by the Android loader
+#     with "cannot execute: required file not found";
+#   * zig also produces a static PIE with a musl interp, which Termux runs.
+# ---------------------------------------------------------------------------
+
+on:
+  # Manual runs: pick a tag, or leave it empty for the newest upstream tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Vaultwarden version/tag to build (empty = newest upstream tag)"
+        required: false
+        default: ""
+        type: string
+      source:
+        description: "Where to take the source from"
+        required: true
+        default: upstream
+        type: choice
+        options:
+          - upstream
+          - this-fork
+      release:
+        description: "Publish the binary as a GitHub release"
+        required: true
+        default: true
+        type: boolean
+
+  # Automatic: follow new upstream releases.
+  schedule:
+    - cron: "0 3 * * *"
+
+  # Automatic: build this fork whenever it changes.
+  push:
+    branches:
+      - main
+      - termux-build
+    tags:
+      - "termux-*"
+
+permissions:
+  contents: read
+
+# Never let two builds fight over the same cache/release.
+concurrency:
+  group: termux-build-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TARGET: aarch64-unknown-linux-musl
+  ZIG_VERSION: "0.15.2"
+  UPSTREAM_REPO: dani-garcia/vaultwarden
+
+jobs:
+  resolve:
+    name: Resolve source revision
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      repo: ${{ steps.resolve.outputs.repo }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      skip: ${{ steps.resolve.outputs.skip }}
+    steps:
+      - name: "Resolve"
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_REF_NAME: ${{ github.ref_name }}
+          EVENT_SHA: ${{ github.sha }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_SOURCE: ${{ inputs.source }}
+          INPUT_RELEASE: ${{ inputs.release }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          version=""
+          ref=""
+          publish="true"
+          skip="false"
+
+          newest_upstream_tag() {
+            # Tags are listed as "refs/tags/<name>"; keep plain x.y.z versions and
+            # sort them numerically (sort -V), so 1.37.10 is newer than 1.37.3.
+            git ls-remote --tags --refs "https://github.com/${UPSTREAM_REPO}.git" \
+              | awk -F/ '{print $NF}' \
+              | sed -E 's/^v//' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -n 1
+          }
+
+          release_exists() {
+            # True when the release with this tag is already published.
+            local code
+            code="$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$1" || echo 000)"
+            [[ "${code}" == "200" ]]
+          }
+
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            # -------------------------------------------------------------
+            # A push to this fork: build the fork at the pushed commit.
+            # -------------------------------------------------------------
+            repo="${GITHUB_REPOSITORY}"
+            sha="${EVENT_SHA}"
+            if [[ "${EVENT_REF}" == refs/tags/* ]]; then
+              # termux-1.37.3 -> 1.37.3
+              version="${EVENT_REF_NAME#termux-}"
+              version="${version#v}"
+            else
+              # Label branch builds like upstream does for its own main branch:
+              # "<newest release tag>-<short sha>".
+              base="$(newest_upstream_tag || true)"
+              if [[ -n "${base}" ]]; then
+                version="${base}-${EVENT_SHA:0:8}"
+              else
+                version="${EVENT_SHA:0:8}"
+              fi
+              # A push to a branch only produces an artifact (downloadable from the
+              # run summary). Tag a build with "termux-<version>" to make a release.
+              publish="false"
+            fi
+          else
+            # -------------------------------------------------------------
+            # Manual run or scheduled run: build an upstream (or fork) tag.
+            # -------------------------------------------------------------
+            if [[ "${EVENT_NAME}" == "workflow_dispatch" && "${INPUT_SOURCE}" == "this-fork" ]]; then
+              repo="${GITHUB_REPOSITORY}"
+            else
+              repo="${UPSTREAM_REPO}"
+            fi
+
+            if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+              ref="${INPUT_TAG}"
+              if [[ "${INPUT_RELEASE}" != "true" ]]; then
+                publish="false"
+              fi
+            fi
+
+            if [[ -z "${ref}" ]]; then
+              ref="$(newest_upstream_tag || true)"
+            fi
+            if [[ -z "${ref}" ]]; then
+              echo "::error::Could not determine a tag to build"
+              exit 1
+            fi
+
+            version="${ref#v}"
+            sha="$(git ls-remote "https://github.com/${repo}.git" "refs/tags/${ref}^{}" | cut -f1)"
+            if [[ -z "${sha}" ]]; then
+              sha="$(git ls-remote "https://github.com/${repo}.git" "refs/tags/${ref}" | cut -f1)"
+            fi
+
+            # Scheduled runs only build something that is not released yet.
+            if [[ "${EVENT_NAME}" == "schedule" ]] && release_exists "termux-${version}"; then
+              echo "termux-${version} is already released, nothing to do."
+              skip="true"
+              publish="false"
+            fi
+          fi
+
+          # Make sure we ended up with a real 40 character commit SHA (a tag
+          # object SHA would make the checkout step fail with a vague error).
+          if [[ ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve a commit SHA for ${repo} (got '${sha}')"
+            exit 1
+          fi
+
+          {
+            echo "repo=${repo}"
+            echo "sha=${sha}"
+            echo "version=${version}"
+            echo "publish=${publish}"
+            echo "skip=${skip}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### Source"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| repository | ${repo} |"
+            echo "| commit | ${sha} |"
+            echo "| version | ${version} |"
+            echo "| publish release | ${publish} |"
+            echo "| skipped | ${skip} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  build:
+    name: Build ${{ needs.resolve.outputs.version }}
+    needs: resolve
+    if: ${{ needs.resolve.outputs.skip != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      SOURCE_REPO: ${{ needs.resolve.outputs.repo }}
+      SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
+      SOURCE_VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: "Free disk space"
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+          df -h /
+
+      - name: "Cache cargo/rustup"
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.rustup/toolchains
+          key: termux-${{ env.TARGET }}-rust-${{ env.SOURCE_SHA }}
+          restore-keys: |
+            termux-${{ env.TARGET }}-rust-
+
+      - name: "Install Rust, cargo-zigbuild and zig"
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal --default-toolchain 1.98.1
+          export PATH="${HOME}/.cargo/bin:${PATH}"
+          rustc -vV
+          rustup target add "${TARGET}"
+          cargo install cargo-zigbuild --locked
+
+          # zig comes from the ziglang wheel: the binary lives inside the python
+          # package, so it is exposed as an executable named "zig" on PATH.
+          ZIG_PY="python3"
+          if python3 -m venv "${HOME}/zigvenv" 2>/dev/null \
+             && "${HOME}/zigvenv/bin/pip" install --quiet "ziglang==${ZIG_VERSION}"; then
+            ZIG_PY="${HOME}/zigvenv/bin/python"
+          else
+            python3 -m pip install --quiet --user --break-system-packages "ziglang==${ZIG_VERSION}"
+          fi
+
+          ZIG_BIN="$("${ZIG_PY}" -c 'import ziglang, os; print(os.path.join(os.path.dirname(ziglang.__file__), "zig"))')"
+          mkdir -p "${HOME}/.local/bin"
+          ln -sf "${ZIG_BIN}" "${HOME}/.local/bin/zig"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          "${HOME}/.local/bin/zig" version
+
+      - name: "Checkout vaultwarden ${SOURCE_VERSION}"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_SHA }}
+          path: src
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: "Show source revision"
+        working-directory: src
+        run: |
+          set -euo pipefail
+          git log -1 --format='%H %ci %s'
+
+      - name: "Build (static aarch64-unknown-linux-musl)"
+        working-directory: src
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+          VW_VERSION: ${{ env.SOURCE_VERSION }}
+        run: |
+          set -euo pipefail
+          export PATH="${HOME}/.cargo/bin:${PATH}"
+
+          cargo zigbuild --release --locked \
+            --target "${TARGET}" \
+            --features sqlite,vendored_openssl
+
+          file "target/${TARGET}/release/vaultwarden"
+
+      - name: "Verify binary"
+        working-directory: src
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/vaultwarden"
+          FILE_OUT="$(file -b "${BIN}")"
+          echo "${FILE_OUT}"
+
+          if [[ "${FILE_OUT}" != *"ARM aarch64"* ]]; then
+            echo "::error::Not an aarch64 binary: ${FILE_OUT}"
+            exit 1
+          fi
+          if [[ "${FILE_OUT}" != *"static"* ]]; then
+            echo "::error::Binary is not statically linked: ${FILE_OUT}"
+            exit 1
+          fi
+
+          # __register_frame_info comes from gcc_Unwind and is NOT provided by
+          # the Android loader on every device: warn loudly if it slipped in.
+          if grep -aq '__register_frame_info' "${BIN}"; then
+            echo "::warning::binary references __register_frame_info, which may fail on some Android versions"
+          fi
+
+          for lib in libssl libcrypto libsqlite3; do
+            if grep -aq "NEEDED.*${lib}" "${BIN}" 2>/dev/null; then
+              echo "::warning::binary may link ${lib} dynamically"
+            fi
+          done
+
+      - name: "Smoke test (qemu-user)"
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # Run the cross compiled binary under emulation to prove it actually
+          # starts (this cannot catch Android loader problems, but it does catch
+          # a broken/unrunnable binary).
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static
+          timeout 60 qemu-aarch64-static "target/${TARGET}/release/vaultwarden" --version
+
+      - name: "Package artifact"
+        working-directory: src
+        run: |
+          set -euo pipefail
+          NAME="vaultwarden-${SOURCE_VERSION}-${TARGET}"
+          cp "target/${TARGET}/release/vaultwarden" "../${NAME}"
+          (cd .. && sha256sum "${NAME}" > "${NAME}.sha256" && cat "${NAME}.sha256" && ls -lh "${NAME}")
+
+      - name: "Upload artifact"
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vaultwarden-${{ needs.resolve.outputs.version }}-aarch64
+          path: |
+            vaultwarden-${{ needs.resolve.outputs.version }}-${{ env.TARGET }}
+            vaultwarden-${{ needs.resolve.outputs.version }}-${{ env.TARGET }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish release
+    needs: [resolve, build]
+    if: ${{ needs.resolve.outputs.publish == 'true' && needs.resolve.outputs.skip != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: "Download artifact"
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vaultwarden-${{ needs.resolve.outputs.version }}-aarch64
+          path: dist
+
+      - name: "Create / update release termux-${{ needs.resolve.outputs.version }}"
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: termux-${{ needs.resolve.outputs.version }}
+          name: "vaultwarden ${{ needs.resolve.outputs.version }} (Termux / aarch64)"
+          body: |
+            Statically linked `aarch64` binary of vaultwarden ${{ needs.resolve.outputs.version }},
+            built from ${{ needs.resolve.outputs.repo }}@${{ needs.resolve.outputs.sha }}.
+
+            Runs on Termux (Android arm64) and on any musl Linux aarch64 system.
+
+            ### Install in Termux
+
+            ```sh
+            pkg install curl
+            curl -LO https://github.com/${{ github.repository }}/releases/download/termux-${{ needs.resolve.outputs.version }}/vaultwarden-${{ needs.resolve.outputs.version }}-${{ env.TARGET }}
+            chmod +x vaultwarden-*-aarch64-unknown-linux-musl
+            mkdir -p ~/.local/bin
+            mv vaultwarden-*-aarch64-unknown-linux-musl ~/.local/bin/vaultwarden
+            vaultwarden --version
+            ```
+
+            Check the download against the attached `.sha256` file if you like.
+          files: |
+            dist/vaultwarden-*.sha256
+            dist/vaultwarden-${{ needs.resolve.outputs.version }}-${{ env.TARGET }}
+          draft: false
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
