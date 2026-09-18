@@ -1,0 +1,163 @@
+name: Sync fork with upstream
+
+# ---------------------------------------------------------------------------
+# Keeps this fork up to date with dani-garcia/vaultwarden.
+#
+#     main = upstream/main + this fork's own commits
+#
+# The sync merges (never force pushes), so the commits that only exist in this
+# fork - the Termux build workflow, TERMUX.md, ... - are always preserved.
+#
+# Pushing workflows with GITHUB_TOKEN
+# ----------------------------------
+# GitHub refuses a push made with GITHUB_TOKEN when the *resulting tree* changes
+# any file under .github/workflows/:
+#
+#   ! [remote rejected] ... (refusing to allow a GitHub App to create or update
+#     workflow '...' without 'workflows' permission)
+#
+# Upstream changes its own workflows all the time, so the merge is done in two
+# commits: first the real merge, then a commit that restores this fork's
+# .github/workflows/ to its previous state. The *net* difference against the
+# parent commit therefore contains no workflow change, and the push is accepted
+# (verified against GitHub: net-tree check, not per-commit). As a side effect our
+# own workflow files are never touched by an automatic sync.
+#
+# If the merge conflicts, the job stops and changes nothing - resolve it by hand.
+# Pushes made with the automatic GITHUB_TOKEN do not trigger other workflows,
+# so this can never start a sync/build loop.
+# ---------------------------------------------------------------------------
+
+on:
+  schedule:
+    # Every day at 02:30 UTC, half an hour before the Termux build runs.
+    - cron: "30 2 * * *"
+
+  workflow_dispatch:
+    inputs:
+      upstream:
+        description: "Upstream repository to sync from"
+        required: true
+        default: dani-garcia/vaultwarden
+        type: string
+      branch:
+        description: "Branch to sync"
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-fork-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sync:
+    name: Merge upstream into this fork
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: "Checkout this fork"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          # Optional: set a SYNC_TOKEN secret (a PAT with the "workflow" scope) to
+          # also sync upstream's workflow files. Without it the built in
+          # GITHUB_TOKEN is used and workflows are left untouched.
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: "Merge upstream"
+        env:
+          UPSTREAM: ${{ inputs.upstream || 'dani-garcia/vaultwarden' }}
+          BRANCH: ${{ inputs.branch || 'main' }}
+          # A PAT with the "workflow" scope may push workflow files, GITHUB_TOKEN may not.
+          HAS_WORKFLOW_PERMISSION: ${{ secrets.SYNC_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM}.git"
+
+          git fetch upstream "${BRANCH}"
+
+          upstream_sha="$(git rev-parse "upstream/${BRANCH}")"
+          local_sha="$(git rev-parse HEAD)"
+
+          {
+            echo "### Sync summary"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| upstream | ${UPSTREAM}@${BRANCH} |"
+            echo "| upstream commit | ${upstream_sha} |"
+            echo "| previous commit | ${local_sha} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if git merge-base --is-ancestor "upstream/${BRANCH}" HEAD; then
+            echo "Already up to date with ${UPSTREAM}/${BRANCH}."
+            echo "| result | already up to date |" >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          ahead="$(git rev-list --count "upstream/${BRANCH}..HEAD")"
+          behind="$(git rev-list --count "HEAD..upstream/${BRANCH}")"
+          echo "This fork is ${ahead} commit(s) ahead and ${behind} commit(s) behind."
+
+          if [[ "${ahead}" == "0" ]]; then
+            git merge --ff-only "upstream/${BRANCH}"
+            result="fast-forward"
+          else
+            git merge --no-edit \
+              -m "Merge ${UPSTREAM}@${BRANCH} (${upstream_sha:0:8}) into ${BRANCH}" \
+              "upstream/${BRANCH}" || {
+                echo "::error::Merge conflict while syncing with ${UPSTREAM}/${BRANCH}. Nothing was changed; resolve it manually."
+                git merge --abort || true
+                exit 1
+              }
+            result="merge"
+          fi
+
+          if [[ "${HAS_WORKFLOW_PERMISSION}" != "true" ]]; then
+            # Put .github/workflows back to exactly what this fork had, and drop
+            # workflow files that only upstream added. The resulting tree then
+            # changes no workflow file, so GITHUB_TOKEN is allowed to push it.
+            git checkout "${local_sha}" -- .github/workflows
+            comm -13 \
+              <(git ls-tree -r --name-only "${local_sha}" -- .github/workflows | sort) \
+              <(git ls-tree -r --name-only HEAD -- .github/workflows | sort) \
+              | while IFS= read -r file; do
+                  echo "Dropping workflow added upstream: ${file}"
+                  git rm -q --ignore-unmatch "${file}"
+                done
+            if ! git diff --quiet HEAD; then
+              git commit -q -m "Keep this fork's workflows after upstream sync"
+            fi
+          fi
+
+          # Safety net: a push that changes .github/workflows would be rejected by
+          # GitHub and the sync would silently do nothing.
+          if [[ "${HAS_WORKFLOW_PERMISSION}" != "true" ]] \
+             && ! git diff --quiet "${local_sha}" HEAD -- .github/workflows; then
+            echo "::error::The sync would change .github/workflows, which this token may not push. Aborting."
+            git --no-pager diff --stat "${local_sha}" HEAD -- .github/workflows
+            exit 1
+          fi
+
+          git push origin "HEAD:${BRANCH}"
+
+          {
+            echo "| result | ${result} |"
+            echo "| new commit | $(git rev-parse HEAD) |"
+          } >> "${GITHUB_STEP_SUMMARY}"

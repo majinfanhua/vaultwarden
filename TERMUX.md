@@ -77,3 +77,41 @@ cargo zigbuild --release --locked \
 ```
 
 The result is at `target/aarch64-unknown-linux-musl/release/vaultwarden`.
+
+## Keeping this fork up to date
+
+`.github/workflows/sync-fork.yml` merges `dani-garcia/vaultwarden` into this
+fork every day at 02:30 UTC (and on demand via **Actions -> "Sync fork with
+upstream" -> Run workflow**). It always **merges**, never force pushes, so the
+commits that exist only here (the Termux workflow, this file, ...) are kept:
+
+```
+main = upstream/main + this fork's own commits
+```
+
+If the merge conflicts, the job stops and touches nothing; resolve it by hand.
+
+### The GITHUB_TOKEN / workflow-file limitation
+
+GitHub refuses a push made with the automatic `GITHUB_TOKEN` when the resulting
+tree changes any file under `.github/workflows/`:
+
+```
+! [remote rejected] ... (refusing to allow a GitHub App to create or update
+  workflow '...' without 'workflows' permission)
+```
+
+Upstream edits its own workflows often, so the sync works around this by making
+a second commit that puts `.github/workflows/` back to exactly what this fork
+had (and dropping workflow files that only upstream added). GitHub checks the
+*net* tree difference, so the push is accepted, and as a side effect the
+automatic sync never touches this fork's workflows.
+
+Consequence: upstream's changes to `.github/workflows/` are **not** synced into
+this fork. That is normally what you want, since those workflows are the ones
+publishing upstream's own containers and releases.
+
+If you *do* want them, create a **fine-grained personal access token** with
+*Contents: Read and write* plus the **Workflow** permission, save it as the
+repository secret `SYNC_TOKEN`, and the sync will use it and stop rewriting
+`.github/workflows/`.
